@@ -93,12 +93,15 @@ func main() {
 		loginCmd      = flag.NewFlagSet("login", flag.ExitOnError)
 		logoutCmd     = flag.NewFlagSet("logout", flag.ExitOnError)
 		accountCmd    = flag.NewFlagSet("account", flag.ExitOnError)
+		pingCmd       = flag.NewFlagSet("ping", flag.ExitOnError)
 	)
 
 	connectToken := connectCmd.String("token", "", "Authentication token")
 	serversBeta := serversCmd.Bool("beta", false, "List beta servers")
 	loginUser := loginCmd.String("u", "", "Username (email) for token login")
 	loginAnon := loginCmd.Bool("anonymous", false, "Create anonymous account for crypto payments")
+	pingCount := pingCmd.Int("c", 4, "Number of pings (0 = infinite)")
+	pingRegion := pingCmd.String("region", "", "Region ID or name")
 
 	if len(os.Args) < 2 {
 		printUsage()
@@ -161,6 +164,15 @@ func main() {
 		if err := listServers(ctx, *serversBeta); err != nil {
 			log.Fatalf("List servers failed: %v", err)
 		}
+	case "ping":
+		pingCmd.Parse(os.Args[2:])
+		target := ""
+		if pingCmd.NArg() > 0 {
+			target = pingCmd.Arg(0)
+		}
+		if err := doPing(ctx, target, *pingCount, *pingRegion); err != nil {
+			log.Fatalf("Ping failed: %v", err)
+		}
 	default:
 		printUsage()
 		os.Exit(1)
@@ -182,6 +194,8 @@ func printUsage() {
 	fmt.Println("  vpnet-cli disconnect               - Disconnect from VPN")
 	fmt.Println("  vpnet-cli status                   - Show connection status")
 	fmt.Println("  vpnet-cli servers [--beta]         - List available servers")
+	fmt.Println("  vpnet-cli ping [-c N] [-region R] [TARGET]")
+	fmt.Println("                                     - Ping through VPN tunnel (no root needed)")
 }
 
 func getConfigDir() (string, error) {
