@@ -2,18 +2,25 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"time"
 
+	"github.com/KarpelesLab/echeck"
 	"github.com/vpdotnet/wgnet"
 )
 
-func doPing(ctx context.Context, target string, count int, regionID string) error {
+func doPing(ctx context.Context, target string, count int, regionID string, useBeta bool) error {
 	auth, err := loadAuth()
 	if err != nil {
 		return fmt.Errorf("not authenticated, please run 'vpnet-cli login' first")
@@ -38,7 +45,7 @@ func doPing(ctx context.Context, target string, count int, regionID string) erro
 	}
 
 	// Fetch server list
-	serverList, err := fetchServerList(ctx, cfg.UseBeta)
+	serverList, err := fetchServerList(ctx, useBeta || cfg.UseBeta)
 	if err != nil {
 		return err
 	}
@@ -78,32 +85,30 @@ func doPing(ctx context.Context, target string, count int, regionID string) erro
 		}
 	}
 
-	// Register our public key with the server
-	var regResult map[string]any
-	err = auth.Apply(ctx, "VPN/Server/"+region.ID+":register", "POST", map[string]any{
-		"public_key": cfg.PublicKey,
-	}, &regResult)
+	// Register our public key with the server via direct HTTPS call
+	regResult, err := registerWithServer(selectedServer.IP, cfg.PublicKey, auth.data.APIToken)
 	if err != nil {
 		return fmt.Errorf("registration failed: %w", err)
 	}
 
-	serverKeyStr := firstString(regResult, "server_key", "server_pubkey", "pubkey")
-	if serverKeyStr == "" {
-		return fmt.Errorf("no server key in response: %v", regResult)
+	if regResult.ServerKey == "" {
+		return fmt.Errorf("no server key in response")
 	}
 
-	peerIPStr := firstString(regResult, "peer_ip", "ip", "client_ip")
+	peerIPStr := regResult.PeerIP
 	if peerIPStr == "" {
-		return fmt.Errorf("no peer IP in response: %v", regResult)
+		return fmt.Errorf("no peer IP in response")
 	}
 
-	if p, ok := regResult["server_port"].(float64); ok && p > 0 {
-		wgPort = int(p)
+	if regResult.ServerPort > 0 {
+		wgPort = regResult.ServerPort
 	}
+
+	serverKeyStr := regResult.ServerKey
 
 	// Determine ping target
 	if target == "" {
-		target = firstString(regResult, "server_vip", "server_ip", "gateway")
+		target = regResult.ServerVIP
 		if target == "" {
 			target = "10.0.0.1"
 		}
@@ -279,6 +284,84 @@ done:
 	}
 
 	return nil
+}
+
+// addKeyResponse is the JSON response from the server's /addKey endpoint.
+type addKeyResponse struct {
+	Status     string   `json:"status"`
+	PeerIP     string   `json:"peer_ip"`
+	PeerPubkey string   `json:"peer_pubkey"`
+	ServerIP   string   `json:"server_ip"`
+	ServerKey  string   `json:"server_key"`
+	ServerPort int      `json:"server_port"`
+	ServerVIP  string   `json:"server_vip"`
+	DNSServers []string `json:"dns_servers"`
+}
+
+// registerWithServer connects to the WireGuard server on port 443,
+// verifies the SGX certificate via echeck, and calls /addKey to register
+// our public key and obtain connection parameters.
+func registerWithServer(serverIP, pubKeyBase64, apiToken string) (*addKeyResponse, error) {
+	// Decode base64 public key to hex
+	pubKeyBytes, err := base64.StdEncoding.DecodeString(pubKeyBase64)
+	if err != nil {
+		return nil, fmt.Errorf("invalid public key: %w", err)
+	}
+	pubKeyHex := strings.ToUpper(hex.EncodeToString(pubKeyBytes))
+
+	// Connect to server with TLS, verify CN=WG and SGX attestation via echeck
+	client := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true,
+				VerifyConnection: func(cs tls.ConnectionState) error {
+					if len(cs.PeerCertificates) == 0 {
+						return fmt.Errorf("no certificates from server")
+					}
+					cert := cs.PeerCertificates[0]
+					if cert.Subject.CommonName != "WG" {
+						return fmt.Errorf("unexpected certificate CN=%q, expected WG", cert.Subject.CommonName)
+					}
+					// Verify SGX attestation
+					quote, err := echeck.ExtractQuote(cert)
+					if err != nil {
+						return fmt.Errorf("SGX quote extraction failed: %w", err)
+					}
+					if err := echeck.VerifyQuote(cert, quote); err != nil {
+						return fmt.Errorf("SGX quote verification failed: %w", err)
+					}
+					return nil
+				},
+			},
+		},
+	}
+
+	url := fmt.Sprintf("https://%s/addKey?pubkey=%s&pt=%s", serverIP, pubKeyHex, apiToken)
+	resp, err := client.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("server returned %d: %s", resp.StatusCode, string(body))
+	}
+
+	var result addKeyResponse
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, fmt.Errorf("parsing response: %w", err)
+	}
+
+	if result.Status != "OK" {
+		return nil, fmt.Errorf("server returned status: %s", result.Status)
+	}
+
+	return &result, nil
 }
 
 // firstString returns the first non-empty string value from a map for the given keys.

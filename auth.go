@@ -195,23 +195,21 @@ func (auth *authInfo) loginPassword(username, password string) error {
 // requestEmailToken asks the server to send a login token to the given email address.
 func (auth *authInfo) requestEmailToken(email string) error {
 	return vpnAPICall(context.Background(), "Network/VPN:apiV2", "POST", map[string]any{
-		"resource": "client/v5/request_token",
+		"resource": "client/v2/login_link",
 		"email":    email,
 	}, "", nil)
 }
 
 // loginToken authenticates by consuming an email token.
-func (auth *authInfo) loginToken(email, token string) error {
+func (auth *authInfo) loginToken(token string) error {
 	var res struct {
 		APIToken  string `json:"api_token"`
 		ExpiresAt string `json:"expires_at"`
 	}
 
 	err := vpnAPICall(context.Background(), "Network/VPN:apiV2", "POST", map[string]any{
-		"resource": "client/v5/api_token",
-		"email":    email,
-		"token":    token,
-	}, "", &res)
+		"resource": "client/v5/refresh",
+	}, "Token "+token, &res)
 	if err != nil {
 		return fmt.Errorf("login failed: %w", err)
 	}

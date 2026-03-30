@@ -103,6 +103,7 @@ func main() {
 	loginEmailToken := loginCmd.Bool("token", false, "Use email token instead of password")
 	pingCount := pingCmd.Int("c", 4, "Number of pings (0 = infinite)")
 	pingRegion := pingCmd.String("region", "", "Region ID or name")
+	pingBeta := pingCmd.Bool("beta", false, "Use beta servers")
 
 	if len(os.Args) < 2 {
 		printUsage()
@@ -171,7 +172,7 @@ func main() {
 		if pingCmd.NArg() > 0 {
 			target = pingCmd.Arg(0)
 		}
-		if err := doPing(ctx, target, *pingCount, *pingRegion); err != nil {
+		if err := doPing(ctx, target, *pingCount, *pingRegion, *pingBeta); err != nil {
 			log.Fatalf("Ping failed: %v", err)
 		}
 	default:
@@ -279,7 +280,7 @@ func doLogin(ctx context.Context, username string, anonymous bool, emailToken bo
 		if token == "" {
 			return fmt.Errorf("no token provided")
 		}
-		if err := auth.loginToken(username, token); err != nil {
+		if err := auth.loginToken(token); err != nil {
 			return err
 		}
 
@@ -749,13 +750,9 @@ func doConnect(ctx context.Context, token string) error {
 	selectedServer := wgServers[0]
 	fmt.Printf("Connecting to server: %s\n", selectedServer.CN)
 
-	// Register our public key with the server
-	// This would typically be done via an API call
+	// Register our public key with the server via direct HTTPS
 	fmt.Println("Registering with server...")
-	var regResult map[string]any
-	err = auth.Apply(ctx, "VPN/Server/"+selectedRegion.ID+":register", "POST", map[string]any{
-		"public_key": cfg.PublicKey,
-	}, &regResult)
+	_, err = registerWithServer(selectedServer.IP, cfg.PublicKey, auth.data.APIToken)
 	if err != nil {
 		return fmt.Errorf("failed to register with server: %w", err)
 	}
