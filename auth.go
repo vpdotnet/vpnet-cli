@@ -165,8 +165,8 @@ func (auth *authInfo) loginOAuth2() error {
 	}
 }
 
-// loginToken authenticates with username/password via the VPN API
-func (auth *authInfo) loginToken(username, password string) error {
+// loginPassword authenticates with email and password via the VPN API.
+func (auth *authInfo) loginPassword(username, password string) error {
 	var res struct {
 		APIToken  string `json:"api_token"`
 		ExpiresAt string `json:"expires_at"`
@@ -176,6 +176,41 @@ func (auth *authInfo) loginToken(username, password string) error {
 		"resource": "client/v5/api_token",
 		"username": username,
 		"password": password,
+	}, "", &res)
+	if err != nil {
+		return fmt.Errorf("login failed: %w", err)
+	}
+	if res.APIToken == "" {
+		return fmt.Errorf("no api_token in response")
+	}
+
+	auth.data.Method = AuthVPNToken
+	auth.data.APIToken = res.APIToken
+	auth.data.ExpiresAt = res.ExpiresAt
+	auth.data.OAuth2 = nil
+
+	return nil
+}
+
+// requestEmailToken asks the server to send a login token to the given email address.
+func (auth *authInfo) requestEmailToken(email string) error {
+	return vpnAPICall(context.Background(), "Network/VPN:apiV2", "POST", map[string]any{
+		"resource": "client/v5/request_token",
+		"email":    email,
+	}, "", nil)
+}
+
+// loginToken authenticates by consuming an email token.
+func (auth *authInfo) loginToken(email, token string) error {
+	var res struct {
+		APIToken  string `json:"api_token"`
+		ExpiresAt string `json:"expires_at"`
+	}
+
+	err := vpnAPICall(context.Background(), "Network/VPN:apiV2", "POST", map[string]any{
+		"resource": "client/v5/api_token",
+		"email":    email,
+		"token":    token,
 	}, "", &res)
 	if err != nil {
 		return fmt.Errorf("login failed: %w", err)

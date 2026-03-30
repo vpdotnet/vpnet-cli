@@ -98,8 +98,9 @@ func main() {
 
 	connectToken := connectCmd.String("token", "", "Authentication token")
 	serversBeta := serversCmd.Bool("beta", false, "List beta servers")
-	loginUser := loginCmd.String("u", "", "Username (email) for token login")
+	loginUser := loginCmd.String("u", "", "Username (email)")
 	loginAnon := loginCmd.Bool("anonymous", false, "Create anonymous account for crypto payments")
+	loginEmailToken := loginCmd.Bool("token", false, "Use email token instead of password")
 	pingCount := pingCmd.Int("c", 4, "Number of pings (0 = infinite)")
 	pingRegion := pingCmd.String("region", "", "Region ID or name")
 
@@ -113,7 +114,7 @@ func main() {
 	switch os.Args[1] {
 	case "login":
 		loginCmd.Parse(os.Args[2:])
-		if err := doLogin(ctx, *loginUser, *loginAnon); err != nil {
+		if err := doLogin(ctx, *loginUser, *loginAnon, *loginEmailToken); err != nil {
 			log.Fatalf("Login failed: %v", err)
 		}
 	case "logout":
@@ -184,6 +185,7 @@ func printUsage() {
 	fmt.Println("\nUsage:")
 	fmt.Println("  vpnet-cli login                    - Authenticate via OAuth2 (default)")
 	fmt.Println("  vpnet-cli login -u EMAIL           - Authenticate with email/password")
+	fmt.Println("  vpnet-cli login -u EMAIL --token   - Authenticate with email token")
 	fmt.Println("  vpnet-cli login --anonymous        - Create anonymous account (crypto)")
 	fmt.Println("  vpnet-cli logout                   - Invalidate token and log out")
 	fmt.Println("  vpnet-cli account                  - Show account/subscription info")
@@ -254,7 +256,7 @@ func saveConfig(cfg *Config) error {
 	return nil
 }
 
-func doLogin(ctx context.Context, username string, anonymous bool) error {
+func doLogin(ctx context.Context, username string, anonymous bool, emailToken bool) error {
 	auth := &authInfo{}
 	if err := auth.init(); err != nil {
 		return err
@@ -267,15 +269,29 @@ func doLogin(ctx context.Context, username string, anonymous bool) error {
 			return err
 		}
 
+	case username != "" && emailToken:
+		// Email token login: server sends a code to the email
+		fmt.Printf("Requesting login token for %s...\n", username)
+		if err := auth.requestEmailToken(username); err != nil {
+			return err
+		}
+		token := promptLine("Enter token from email: ")
+		if token == "" {
+			return fmt.Errorf("no token provided")
+		}
+		if err := auth.loginToken(username, token); err != nil {
+			return err
+		}
+
 	case username != "":
-		// Token-based login with username/password
+		// Email + password login
 		fmt.Print("Password: ")
 		passwordBytes, err := term.ReadPassword(int(os.Stdin.Fd()))
 		fmt.Println()
 		if err != nil {
 			return fmt.Errorf("failed to read password: %w", err)
 		}
-		if err := auth.loginToken(username, string(passwordBytes)); err != nil {
+		if err := auth.loginPassword(username, string(passwordBytes)); err != nil {
 			return err
 		}
 

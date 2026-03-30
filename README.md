@@ -32,7 +32,7 @@ go build
 # OAuth2 login (opens browser)
 vpnet-cli login
 
-# Email/password login
+# Email token login (sends a code to your email)
 vpnet-cli login -u user@example.com
 
 # Create anonymous account (for crypto payments)
