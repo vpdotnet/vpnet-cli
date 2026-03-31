@@ -31,17 +31,10 @@ func doPing(ctx context.Context, target string, count int, regionID string, useB
 		return err
 	}
 
-	// Generate WireGuard keys if needed
-	if cfg.PrivateKey == "" || cfg.PublicKey == "" {
-		privKey, pubKey, err := generateWireGuardKeyPair()
-		if err != nil {
-			return err
-		}
-		cfg.PrivateKey = privKey
-		cfg.PublicKey = pubKey
-		if err := saveConfig(cfg); err != nil {
-			return err
-		}
+	// Generate ephemeral WireGuard keypair for this session
+	privKeyB64, pubKeyB64, err := generateWireGuardKeyPair()
+	if err != nil {
+		return err
 	}
 
 	// Fetch server list
@@ -86,7 +79,7 @@ func doPing(ctx context.Context, target string, count int, regionID string, useB
 	}
 
 	// Register our public key with the server via direct HTTPS call
-	regResult, err := registerWithServer(selectedServer.IP, cfg.PublicKey, auth.data.APIToken)
+	regResult, err := registerWithServer(selectedServer.IP, pubKeyB64, auth.data.APIToken)
 	if err != nil {
 		return fmt.Errorf("registration failed: %w", err)
 	}
@@ -106,7 +99,7 @@ func doPing(ctx context.Context, target string, count int, regionID string, useB
 
 	serverKeyStr := regResult.ServerKey
 
-	// Determine ping target
+	// Determine ping target (resolve after tunnel is up if it's a hostname)
 	if target == "" {
 		target = regResult.ServerVIP
 		if target == "" {
@@ -114,19 +107,18 @@ func doPing(ctx context.Context, target string, count int, regionID string, useB
 		}
 	}
 
-	targetIP := net.ParseIP(target).To4()
-	if targetIP == nil {
-		return fmt.Errorf("invalid target: %s", target)
-	}
-
 	peerIP := net.ParseIP(peerIPStr).To4()
 	if peerIP == nil {
 		return fmt.Errorf("invalid peer IP: %s", peerIPStr)
 	}
 
+	// Check if target is an IP or needs DNS resolution
+	targetIP := net.ParseIP(target).To4()
+	needsResolve := targetIP == nil
+
 	// Parse WireGuard keys
 	var privKey wgnet.NoisePrivateKey
-	privBytes, err := base64.StdEncoding.DecodeString(cfg.PrivateKey)
+	privBytes, err := base64.StdEncoding.DecodeString(privKeyB64)
 	if err != nil {
 		return fmt.Errorf("invalid private key: %w", err)
 	}
@@ -195,6 +187,24 @@ func doPing(ctx context.Context, target string, count int, regionID string, useB
 	case <-connectedCh:
 	case <-time.After(5 * time.Second):
 		return fmt.Errorf("handshake timeout")
+	}
+
+	// Resolve hostname via in-tunnel DNS if needed
+	if needsResolve {
+		if len(regResult.DNSServers) == 0 {
+			return fmt.Errorf("cannot resolve %s: no DNS servers from server", target)
+		}
+		dnsServer := net.ParseIP(regResult.DNSServers[0]).To4()
+		if dnsServer == nil {
+			return fmt.Errorf("invalid DNS server: %s", regResult.DNSServers[0])
+		}
+		fmt.Printf("Resolving %s via %s...\n", target, dnsServer)
+		resolved, err := resolveViaTunnel(srv, serverPubKey, peerIP, dnsServer, target, pktCh)
+		if err != nil {
+			return fmt.Errorf("DNS resolution failed: %w", err)
+		}
+		targetIP = resolved
+		fmt.Printf("%s resolved to %s\n", target, targetIP)
 	}
 
 	fmt.Printf("PING %s from %s via %s (%s)\n", targetIP, peerIP, region.Name, region.Country)
@@ -467,4 +477,143 @@ func ipHeaderLen(ipPkt []byte) int {
 		return 0
 	}
 	return int(ipPkt[0]&0x0f) * 4
+}
+
+// resolveViaTunnel sends a DNS A query through the WireGuard tunnel and returns the first IP.
+func resolveViaTunnel(srv *wgnet.Server, serverPubKey wgnet.NoisePublicKey, srcIP, dnsServer net.IP, hostname string, pktCh chan []byte) (net.IP, error) {
+	dnsID := uint16(os.Getpid() & 0xffff)
+	query := buildDNSQuery(dnsID, hostname)
+	udpPkt := buildUDPPacket(query, 12345, 53)
+	ipPkt := buildIPv4Packet(srcIP, dnsServer, 17, udpPkt) // protocol 17 = UDP
+
+	if err := srv.Send(ipPkt, serverPubKey); err != nil {
+		return nil, fmt.Errorf("sending DNS query: %w", err)
+	}
+
+	timeout := time.After(5 * time.Second)
+	for {
+		select {
+		case pkt := <-pktCh:
+			ip := parseDNSResponse(pkt, dnsID)
+			if ip != nil {
+				return ip, nil
+			}
+		case <-timeout:
+			return nil, fmt.Errorf("DNS resolution timeout for %s", hostname)
+		}
+	}
+}
+
+// buildDNSQuery builds a minimal DNS A record query.
+func buildDNSQuery(id uint16, hostname string) []byte {
+	var buf []byte
+
+	// Header: ID, flags (standard query, recursion desired), QDCOUNT=1
+	buf = binary.BigEndian.AppendUint16(buf, id)
+	buf = binary.BigEndian.AppendUint16(buf, 0x0100) // RD=1
+	buf = binary.BigEndian.AppendUint16(buf, 1)      // QDCOUNT
+	buf = binary.BigEndian.AppendUint16(buf, 0)      // ANCOUNT
+	buf = binary.BigEndian.AppendUint16(buf, 0)      // NSCOUNT
+	buf = binary.BigEndian.AppendUint16(buf, 0)      // ARCOUNT
+
+	// Question: encode hostname as DNS labels
+	for _, label := range strings.Split(hostname, ".") {
+		buf = append(buf, byte(len(label)))
+		buf = append(buf, []byte(label)...)
+	}
+	buf = append(buf, 0) // root label
+
+	buf = binary.BigEndian.AppendUint16(buf, 1) // QTYPE: A
+	buf = binary.BigEndian.AppendUint16(buf, 1) // QCLASS: IN
+
+	return buf
+}
+
+// buildUDPPacket wraps a payload in a UDP header.
+func buildUDPPacket(payload []byte, srcPort, dstPort uint16) []byte {
+	length := uint16(8 + len(payload))
+	hdr := make([]byte, 8)
+	binary.BigEndian.PutUint16(hdr[0:2], srcPort)
+	binary.BigEndian.PutUint16(hdr[2:4], dstPort)
+	binary.BigEndian.PutUint16(hdr[4:6], length)
+	// checksum = 0 (optional for IPv4 UDP)
+	return append(hdr, payload...)
+}
+
+// parseDNSResponse extracts the first A record IP from a DNS response inside an IPv4/UDP packet.
+func parseDNSResponse(ipPkt []byte, expectedID uint16) net.IP {
+	if len(ipPkt) < 20 {
+		return nil
+	}
+	ihl := int(ipPkt[0]&0x0f) * 4
+	if ipPkt[9] != 17 { // not UDP
+		return nil
+	}
+	if len(ipPkt) < ihl+8 {
+		return nil
+	}
+	udp := ipPkt[ihl:]
+	dns := udp[8:] // skip UDP header
+
+	if len(dns) < 12 {
+		return nil
+	}
+
+	id := binary.BigEndian.Uint16(dns[0:2])
+	if id != expectedID {
+		return nil
+	}
+
+	flags := binary.BigEndian.Uint16(dns[2:4])
+	if flags&0x8000 == 0 { // not a response
+		return nil
+	}
+
+	qdcount := binary.BigEndian.Uint16(dns[4:6])
+	ancount := binary.BigEndian.Uint16(dns[6:8])
+
+	// Skip questions
+	off := 12
+	for i := 0; i < int(qdcount); i++ {
+		off = skipDNSName(dns, off)
+		if off < 0 || off+4 > len(dns) {
+			return nil
+		}
+		off += 4 // QTYPE + QCLASS
+	}
+
+	// Parse answers, look for first A record
+	for i := 0; i < int(ancount); i++ {
+		off = skipDNSName(dns, off)
+		if off < 0 || off+10 > len(dns) {
+			return nil
+		}
+		rtype := binary.BigEndian.Uint16(dns[off : off+2])
+		rdlength := binary.BigEndian.Uint16(dns[off+8 : off+10])
+		off += 10
+		if off+int(rdlength) > len(dns) {
+			return nil
+		}
+		if rtype == 1 && rdlength == 4 { // A record
+			return net.IPv4(dns[off], dns[off+1], dns[off+2], dns[off+3]).To4()
+		}
+		off += int(rdlength)
+	}
+
+	return nil
+}
+
+// skipDNSName advances past a DNS name (handling compression pointers).
+func skipDNSName(dns []byte, off int) int {
+	for off < len(dns) {
+		length := int(dns[off])
+		if length == 0 {
+			return off + 1
+		}
+		if length&0xC0 == 0xC0 { // compression pointer
+			return off + 2
+		}
+		off += 1 + length
+	}
+	return -1
 }

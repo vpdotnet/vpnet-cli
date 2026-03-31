@@ -48,10 +48,8 @@ G0/YY/gsigdiXvtD5nRn7uECAwEAAQ==
 )
 
 type Config struct {
-	Token      string `json:"token,omitempty"`
-	PrivateKey string `json:"private_key,omitempty"`
-	PublicKey  string `json:"public_key,omitempty"`
-	UseBeta    bool   `json:"use_beta,omitempty"`
+	Token   string `json:"token,omitempty"`
+	UseBeta bool   `json:"use_beta,omitempty"`
 }
 
 type ServerList struct {
@@ -94,6 +92,7 @@ func main() {
 		logoutCmd     = flag.NewFlagSet("logout", flag.ExitOnError)
 		accountCmd    = flag.NewFlagSet("account", flag.ExitOnError)
 		pingCmd       = flag.NewFlagSet("ping", flag.ExitOnError)
+		setKeyCmd     = flag.NewFlagSet("set-key", flag.ExitOnError)
 	)
 
 	connectToken := connectCmd.String("token", "", "Authentication token")
@@ -104,6 +103,7 @@ func main() {
 	pingCount := pingCmd.Int("c", 4, "Number of pings (0 = infinite)")
 	pingRegion := pingCmd.String("region", "", "Region ID or name")
 	pingBeta := pingCmd.Bool("beta", false, "Use beta servers")
+	setKeyBeta := setKeyCmd.Bool("beta", false, "Use beta servers")
 
 	if len(os.Args) < 2 {
 		printUsage()
@@ -175,6 +175,14 @@ func main() {
 		if err := doPing(ctx, target, *pingCount, *pingRegion, *pingBeta); err != nil {
 			log.Fatalf("Ping failed: %v", err)
 		}
+	case "set-key":
+		setKeyCmd.Parse(os.Args[2:])
+		if setKeyCmd.NArg() < 2 {
+			log.Fatalf("Usage: vpnet-cli set-key [-beta] <public-key> <region>")
+		}
+		if err := doSetKey(ctx, setKeyCmd.Arg(0), setKeyCmd.Arg(1), *setKeyBeta); err != nil {
+			log.Fatalf("Set key failed: %v", err)
+		}
 	default:
 		printUsage()
 		os.Exit(1)
@@ -199,6 +207,8 @@ func printUsage() {
 	fmt.Println("  vpnet-cli servers [--beta]         - List available servers")
 	fmt.Println("  vpnet-cli ping [-c N] [-region R] [TARGET]")
 	fmt.Println("                                     - Ping through VPN tunnel (no root needed)")
+	fmt.Println("  vpnet-cli set-key [-beta] PUBKEY REGION")
+	fmt.Println("                                     - Register WireGuard public key and output config")
 }
 
 func getConfigDir() (string, error) {
@@ -703,19 +713,10 @@ func doConnect(ctx context.Context, token string) error {
 		return err
 	}
 
-	// Generate WireGuard keys if needed
-	if cfg.PrivateKey == "" || cfg.PublicKey == "" {
-		fmt.Println("Generating WireGuard key pair...")
-		privKey, pubKey, err := generateWireGuardKeyPair()
-		if err != nil {
-			return err
-		}
-		cfg.PrivateKey = privKey
-		cfg.PublicKey = pubKey
-		if err := saveConfig(cfg); err != nil {
-			return err
-		}
-		fmt.Printf("✓ Generated keys. Public key: %s\n", pubKey)
+	// Generate ephemeral WireGuard keypair for this session
+	_, pubKeyB64, err := generateWireGuardKeyPair()
+	if err != nil {
+		return err
 	}
 
 	// Fetch server list
@@ -752,7 +753,7 @@ func doConnect(ctx context.Context, token string) error {
 
 	// Register our public key with the server via direct HTTPS
 	fmt.Println("Registering with server...")
-	_, err = registerWithServer(selectedServer.IP, cfg.PublicKey, auth.data.APIToken)
+	_, err = registerWithServer(selectedServer.IP, pubKeyB64, auth.data.APIToken)
 	if err != nil {
 		return fmt.Errorf("failed to register with server: %w", err)
 	}
@@ -792,6 +793,71 @@ func generateWireGuardKeyPair() (privateKey, publicKey string, err error) {
 	publicKey = base64.StdEncoding.EncodeToString(pubKey[:])
 
 	return privateKey, publicKey, nil
+}
+
+func doSetKey(ctx context.Context, pubKeyB64, regionName string, useBeta bool) error {
+	keyBytes, err := base64.StdEncoding.DecodeString(pubKeyB64)
+	if err != nil {
+		return fmt.Errorf("invalid base64: %w", err)
+	}
+	if len(keyBytes) != 32 {
+		return fmt.Errorf("invalid key length: got %d bytes, expected 32", len(keyBytes))
+	}
+
+	auth, err := loadAuth()
+	if err != nil {
+		return fmt.Errorf("not authenticated, please run 'vpnet-cli login' first")
+	}
+
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+
+	serverList, err := fetchServerList(ctx, useBeta || cfg.UseBeta)
+	if err != nil {
+		return err
+	}
+
+	// Find region
+	var region *Region
+	for i := range serverList.Regions {
+		r := &serverList.Regions[i]
+		if r.ID == regionName || r.Name == regionName {
+			region = r
+			break
+		}
+	}
+	if region == nil {
+		return fmt.Errorf("region not found: %s", regionName)
+	}
+
+	wgServers, ok := region.Servers["wg"]
+	if !ok || len(wgServers) == 0 {
+		return fmt.Errorf("no WireGuard servers in region %s", region.Name)
+	}
+	selectedServer := wgServers[0]
+
+	// Register public key with the server
+	regResult, err := registerWithServer(selectedServer.IP, pubKeyB64, auth.data.APIToken)
+	if err != nil {
+		return fmt.Errorf("registration failed: %w", err)
+	}
+
+	// Output WireGuard config
+	fmt.Println("[Interface]")
+	fmt.Printf("# PrivateKey = <your private key>\n")
+	fmt.Printf("Address = %s/32\n", regResult.PeerIP)
+	if len(regResult.DNSServers) > 0 {
+		fmt.Printf("DNS = %s\n", strings.Join(regResult.DNSServers, ", "))
+	}
+	fmt.Println()
+	fmt.Println("[Peer]")
+	fmt.Printf("PublicKey = %s\n", regResult.ServerKey)
+	fmt.Printf("Endpoint = %s:%d\n", regResult.ServerIP, regResult.ServerPort)
+	fmt.Println("AllowedIPs = 0.0.0.0/0")
+
+	return nil
 }
 
 func verifyServerListSignature(data, signature []byte) error {
