@@ -93,6 +93,7 @@ func main() {
 		accountCmd    = flag.NewFlagSet("account", flag.ExitOnError)
 		pingCmd       = flag.NewFlagSet("ping", flag.ExitOnError)
 		setKeyCmd     = flag.NewFlagSet("set-key", flag.ExitOnError)
+		wgetCmd       = flag.NewFlagSet("wget", flag.ExitOnError)
 	)
 
 	connectToken := connectCmd.String("token", "", "Authentication token")
@@ -104,6 +105,9 @@ func main() {
 	pingRegion := pingCmd.String("region", "", "Region ID or name")
 	pingBeta := pingCmd.Bool("beta", false, "Use beta servers")
 	setKeyBeta := setKeyCmd.Bool("beta", false, "Use beta servers")
+	wgetOutput := wgetCmd.String("o", "", "Output file (default: filename from URL, - for stdout)")
+	wgetRegion := wgetCmd.String("region", "", "Region ID or name")
+	wgetBeta := wgetCmd.Bool("beta", false, "Use beta servers")
 
 	if len(os.Args) < 2 {
 		printUsage()
@@ -183,6 +187,14 @@ func main() {
 		if err := doSetKey(ctx, setKeyCmd.Arg(0), setKeyCmd.Arg(1), *setKeyBeta); err != nil {
 			log.Fatalf("Set key failed: %v", err)
 		}
+	case "wget":
+		wgetCmd.Parse(os.Args[2:])
+		if wgetCmd.NArg() < 1 {
+			log.Fatalf("Usage: vpnet-cli wget [-beta] [-region R] [-o FILE] URL")
+		}
+		if err := doWget(ctx, wgetCmd.Arg(0), *wgetOutput, *wgetRegion, *wgetBeta); err != nil {
+			log.Fatalf("Download failed: %v", err)
+		}
 	default:
 		printUsage()
 		os.Exit(1)
@@ -209,6 +221,8 @@ func printUsage() {
 	fmt.Println("                                     - Ping through VPN tunnel (no root needed)")
 	fmt.Println("  vpnet-cli set-key [-beta] PUBKEY REGION")
 	fmt.Println("                                     - Register WireGuard public key and output config")
+	fmt.Println("  vpnet-cli wget [-beta] [-region R] [-o FILE] URL")
+	fmt.Println("                                     - Download file through VPN tunnel")
 }
 
 func getConfigDir() (string, error) {

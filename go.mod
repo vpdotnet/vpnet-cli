@@ -1,10 +1,11 @@
 module github.com/vpdotnet/vpnet-cli
 
-go 1.25.0
+go 1.25.3
 
 require (
 	github.com/KarpelesLab/echeck v0.1.3
 	github.com/KarpelesLab/rest v0.6.4
+	github.com/KarpelesLab/slirp v0.1.3
 	github.com/vpdotnet/wgnet v0.1.4
 	golang.org/x/crypto v0.48.0
 	golang.org/x/term v0.41.0
