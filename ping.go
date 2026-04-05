@@ -37,8 +37,13 @@ func doPing(ctx context.Context, target string, count int, regionID string, useB
 		return err
 	}
 
-	// Fetch server list
+	// Fetch server list and enclave list
 	serverList, err := fetchServerList(ctx, useBeta || cfg.UseBeta)
+	if err != nil {
+		return err
+	}
+
+	enclaveList, err := fetchEnclaveList(ctx)
 	if err != nil {
 		return err
 	}
@@ -79,7 +84,7 @@ func doPing(ctx context.Context, target string, count int, regionID string, useB
 	}
 
 	// Register our public key with the server via direct HTTPS call
-	regResult, err := registerWithServer(selectedServer.IP, pubKeyB64, auth.data.APIToken)
+	regResult, err := registerWithServer(selectedServer.IP, pubKeyB64, auth.data.APIToken, enclaveList)
 	if err != nil {
 		return fmt.Errorf("registration failed: %w", err)
 	}
@@ -311,7 +316,7 @@ type addKeyResponse struct {
 // registerWithServer connects to the WireGuard server on port 443,
 // verifies the SGX certificate via echeck, and calls /addKey to register
 // our public key and obtain connection parameters.
-func registerWithServer(serverIP, pubKeyBase64, apiToken string) (*addKeyResponse, error) {
+func registerWithServer(serverIP, pubKeyBase64, apiToken string, validEnclaves []EnclaveEntry) (*addKeyResponse, error) {
 	// Decode base64 public key to hex
 	pubKeyBytes, err := base64.StdEncoding.DecodeString(pubKeyBase64)
 	if err != nil {
@@ -339,6 +344,19 @@ func registerWithServer(serverIP, pubKeyBase64, apiToken string) (*addKeyRespons
 					}
 					if err := echeck.VerifyQuote(cert, quote); err != nil {
 						return fmt.Errorf("SGX quote verification failed: %w", err)
+					}
+					// Verify MRENCLAVE against known valid enclaves
+					info := quote.GetQuoteInfo()
+					mrEnclaveHex := hex.EncodeToString(info.MREnclave[:])
+					matched := false
+					for _, e := range validEnclaves {
+						if e.MREnclave == mrEnclaveHex {
+							matched = true
+							break
+						}
+					}
+					if !matched {
+						return fmt.Errorf("SGX enclave MRENCLAVE %s not in valid enclave list", mrEnclaveHex)
 					}
 					return nil
 				},

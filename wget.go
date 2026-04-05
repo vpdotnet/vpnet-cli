@@ -31,8 +31,13 @@ func doWget(ctx context.Context, rawURL, output, regionID string, useBeta bool) 
 		return err
 	}
 
-	// Fetch server list
+	// Fetch server list and enclave list
 	serverList, err := fetchServerList(ctx, useBeta || cfg.UseBeta)
+	if err != nil {
+		return err
+	}
+
+	enclaveList, err := fetchEnclaveList(ctx)
 	if err != nil {
 		return err
 	}
@@ -73,7 +78,7 @@ func doWget(ctx context.Context, rawURL, output, regionID string, useBeta bool) 
 	}
 
 	// Register our public key with the server
-	regResult, err := registerWithServer(selectedServer.IP, pubKeyB64, auth.data.APIToken)
+	regResult, err := registerWithServer(selectedServer.IP, pubKeyB64, auth.data.APIToken, enclaveList)
 	if err != nil {
 		return fmt.Errorf("registration failed: %w", err)
 	}

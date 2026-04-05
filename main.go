@@ -30,6 +30,7 @@ import (
 const (
 	serverListURL     = "https://serverlist.vp.net/vpninfo/servers/v6"
 	serverListBetaURL = "https://serverlist.vp.net/vpninfo/servers-beta/v6"
+	enclaveListURL    = "https://serverlist.vp.net/vpninfo/enclaves/v1"
 
 	serverListPublicKey = `-----BEGIN PUBLIC KEY-----
 MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAxSqleT52eqaEfBcgInai
@@ -78,6 +79,12 @@ type Server struct {
 	IP    string   `json:"ip"`
 	CN    string   `json:"cn"`
 	Cert  []string `json:"cert,omitempty"`
+}
+
+type EnclaveEntry struct {
+	MREnclave string `json:"mr_enclave"`
+	Status    string `json:"status"`
+	Created   int64  `json:"created"`
 }
 
 func main() {
@@ -733,9 +740,14 @@ func doConnect(ctx context.Context, token string) error {
 		return err
 	}
 
-	// Fetch server list
+	// Fetch server list and enclave list
 	fmt.Println("Fetching server list...")
 	serverList, err := fetchServerList(ctx, cfg.UseBeta)
+	if err != nil {
+		return err
+	}
+
+	enclaveList, err := fetchEnclaveList(ctx)
 	if err != nil {
 		return err
 	}
@@ -767,7 +779,7 @@ func doConnect(ctx context.Context, token string) error {
 
 	// Register our public key with the server via direct HTTPS
 	fmt.Println("Registering with server...")
-	_, err = registerWithServer(selectedServer.IP, pubKeyB64, auth.data.APIToken)
+	_, err = registerWithServer(selectedServer.IP, pubKeyB64, auth.data.APIToken, enclaveList)
 	if err != nil {
 		return fmt.Errorf("failed to register with server: %w", err)
 	}
@@ -833,6 +845,11 @@ func doSetKey(ctx context.Context, pubKeyB64, regionName string, useBeta bool) e
 		return err
 	}
 
+	enclaveList, err := fetchEnclaveList(ctx)
+	if err != nil {
+		return err
+	}
+
 	// Find region
 	var region *Region
 	for i := range serverList.Regions {
@@ -853,7 +870,7 @@ func doSetKey(ctx context.Context, pubKeyB64, regionName string, useBeta bool) e
 	selectedServer := wgServers[0]
 
 	// Register public key with the server
-	regResult, err := registerWithServer(selectedServer.IP, pubKeyB64, auth.data.APIToken)
+	regResult, err := registerWithServer(selectedServer.IP, pubKeyB64, auth.data.APIToken, enclaveList)
 	if err != nil {
 		return fmt.Errorf("registration failed: %w", err)
 	}
@@ -955,6 +972,67 @@ func fetchServerList(ctx context.Context, useBeta bool) (*ServerList, error) {
 	}
 
 	return &serverList, nil
+}
+
+func fetchEnclaveList(ctx context.Context) ([]EnclaveEntry, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", enclaveListURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch enclave list: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("enclave list returned status %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response: %w", err)
+	}
+
+	// Split JSON data and signature (JSON array ends with ']')
+	lastBracket := bytes.LastIndexByte(body, ']')
+	if lastBracket == -1 {
+		return nil, fmt.Errorf("invalid enclave list format: no JSON array found")
+	}
+
+	jsonData := body[:lastBracket+1]
+	sigBase64 := bytes.TrimSpace(body[lastBracket+1:])
+
+	// Decode and verify signature
+	signature, err := base64.StdEncoding.DecodeString(string(sigBase64))
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode enclave list signature: %w", err)
+	}
+
+	if err := verifyServerListSignature(jsonData, signature); err != nil {
+		return nil, fmt.Errorf("enclave list signature verification failed: %w", err)
+	}
+
+	// Parse JSON
+	var entries []EnclaveEntry
+	if err := json.Unmarshal(jsonData, &entries); err != nil {
+		return nil, fmt.Errorf("failed to parse enclave list: %w", err)
+	}
+
+	// Filter to valid enclaves only
+	var valid []EnclaveEntry
+	for _, e := range entries {
+		if e.Status == "valid" {
+			valid = append(valid, e)
+		}
+	}
+
+	if len(valid) == 0 {
+		return nil, fmt.Errorf("no valid enclaves in enclave list")
+	}
+
+	return valid, nil
 }
 
 func listServers(ctx context.Context, useBeta bool) error {
