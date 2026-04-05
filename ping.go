@@ -20,7 +20,7 @@ import (
 	"github.com/vpdotnet/wgnet"
 )
 
-func doPing(ctx context.Context, target string, count int, regionID string, useBeta bool) error {
+func doPing(ctx context.Context, target string, count int, regionID, serverIP string, useBeta bool) error {
 	auth, err := loadAuth()
 	if err != nil {
 		return fmt.Errorf("not authenticated, please run 'vpnet-cli login' first")
@@ -37,48 +37,58 @@ func doPing(ctx context.Context, target string, count int, regionID string, useB
 		return err
 	}
 
-	// Fetch server list and enclave list
-	serverList, err := fetchServerList(ctx, useBeta || cfg.UseBeta)
-	if err != nil {
-		return err
-	}
-
 	enclaveList, err := fetchEnclaveList(ctx)
 	if err != nil {
 		return err
 	}
 
-	// Find region
-	var region *Region
-	for i := range serverList.Regions {
-		r := &serverList.Regions[i]
-		if regionID != "" {
-			if r.ID == regionID || r.Name == regionID {
+	var selectedServer Server
+	var regionName string
+	wgPort := 1337
+
+	if serverIP != "" {
+		// Direct server IP specified, skip region resolution
+		selectedServer = Server{IP: serverIP}
+		regionName = serverIP
+	} else {
+		// Fetch server list and enclave list
+		serverList, err := fetchServerList(ctx, useBeta || cfg.UseBeta)
+		if err != nil {
+			return err
+		}
+
+		// Find region
+		var region *Region
+		for i := range serverList.Regions {
+			r := &serverList.Regions[i]
+			if regionID != "" {
+				if r.ID == regionID || r.Name == regionID {
+					region = r
+					break
+				}
+			} else if !r.Offline && r.AutoRegion {
 				region = r
 				break
 			}
-		} else if !r.Offline && r.AutoRegion {
-			region = r
-			break
 		}
-	}
-	if region == nil {
-		return fmt.Errorf("no suitable region found")
-	}
+		if region == nil {
+			return fmt.Errorf("no suitable region found")
+		}
 
-	wgServers, ok := region.Servers["wg"]
-	if !ok || len(wgServers) == 0 {
-		return fmt.Errorf("no WireGuard servers in region %s", region.Name)
-	}
-	selectedServer := wgServers[0]
+		wgServers, ok := region.Servers["wg"]
+		if !ok || len(wgServers) == 0 {
+			return fmt.Errorf("no WireGuard servers in region %s", region.Name)
+		}
+		selectedServer = wgServers[0]
+		regionName = fmt.Sprintf("%s (%s)", region.Name, region.Country)
 
-	// Get WireGuard port from server groups
-	wgPort := 1337
-	if groups, ok := serverList.Groups["wg"]; ok {
-		for _, g := range groups {
-			if len(g.Ports) > 0 {
-				wgPort = g.Ports[0]
-				break
+		// Get WireGuard port from server groups
+		if groups, ok := serverList.Groups["wg"]; ok {
+			for _, g := range groups {
+				if len(g.Ports) > 0 {
+					wgPort = g.Ports[0]
+					break
+				}
 			}
 		}
 	}
@@ -182,7 +192,7 @@ func doPing(ctx context.Context, target string, count int, regionID string, useB
 		IP:   net.ParseIP(selectedServer.IP),
 		Port: wgPort,
 	}
-	fmt.Printf("Connecting to %s (%s:%d)...\n", region.Name, selectedServer.IP, wgPort)
+	fmt.Printf("Connecting to %s (%s:%d)...\n", regionName, selectedServer.IP, wgPort)
 
 	if err := srv.Connect(serverPubKey, serverAddr); err != nil {
 		return fmt.Errorf("handshake failed: %w", err)
@@ -212,7 +222,7 @@ func doPing(ctx context.Context, target string, count int, regionID string, useB
 		fmt.Printf("%s resolved to %s\n", target, targetIP)
 	}
 
-	fmt.Printf("PING %s from %s via %s (%s)\n", targetIP, peerIP, region.Name, region.Country)
+	fmt.Printf("PING %s from %s via %s\n", targetIP, peerIP, regionName)
 
 	// Signal handling for Ctrl+C
 	sigCh := make(chan os.Signal, 1)

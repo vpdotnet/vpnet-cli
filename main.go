@@ -104,16 +104,22 @@ func main() {
 	)
 
 	connectToken := connectCmd.String("token", "", "Authentication token")
+	connectRegion := connectCmd.String("region", "", "Region ID or name")
+	connectServer := connectCmd.String("server", "", "Server IP address (bypasses region selection)")
+	connectBeta := connectCmd.Bool("beta", false, "Use beta servers")
 	serversBeta := serversCmd.Bool("beta", false, "List beta servers")
 	loginUser := loginCmd.String("u", "", "Username (email)")
 	loginAnon := loginCmd.Bool("anonymous", false, "Create anonymous account for crypto payments")
 	loginEmailToken := loginCmd.Bool("token", false, "Use email token instead of password")
 	pingCount := pingCmd.Int("c", 4, "Number of pings (0 = infinite)")
 	pingRegion := pingCmd.String("region", "", "Region ID or name")
+	pingServer := pingCmd.String("server", "", "Server IP address (bypasses region selection)")
 	pingBeta := pingCmd.Bool("beta", false, "Use beta servers")
 	setKeyBeta := setKeyCmd.Bool("beta", false, "Use beta servers")
+	setKeyServer := setKeyCmd.String("server", "", "Server IP address (bypasses region selection)")
 	wgetOutput := wgetCmd.String("o", "", "Output file (default: filename from URL, - for stdout)")
 	wgetRegion := wgetCmd.String("region", "", "Region ID or name")
+	wgetServer := wgetCmd.String("server", "", "Server IP address (bypasses region selection)")
 	wgetBeta := wgetCmd.Bool("beta", false, "Use beta servers")
 
 	if len(os.Args) < 2 {
@@ -159,7 +165,7 @@ func main() {
 		}
 	case "connect":
 		connectCmd.Parse(os.Args[2:])
-		if err := doConnect(ctx, *connectToken); err != nil {
+		if err := doConnect(ctx, *connectToken, *connectRegion, *connectServer, *connectBeta); err != nil {
 			log.Fatalf("Connect failed: %v", err)
 		}
 	case "disconnect":
@@ -183,7 +189,7 @@ func main() {
 		if pingCmd.NArg() > 0 {
 			target = pingCmd.Arg(0)
 		}
-		if err := doPing(ctx, target, *pingCount, *pingRegion, *pingBeta); err != nil {
+		if err := doPing(ctx, target, *pingCount, *pingRegion, *pingServer, *pingBeta); err != nil {
 			log.Fatalf("Ping failed: %v", err)
 		}
 	case "set-key":
@@ -191,7 +197,7 @@ func main() {
 		if setKeyCmd.NArg() < 2 {
 			log.Fatalf("Usage: vpnet-cli set-key [-beta] <public-key> <region>")
 		}
-		if err := doSetKey(ctx, setKeyCmd.Arg(0), setKeyCmd.Arg(1), *setKeyBeta); err != nil {
+		if err := doSetKey(ctx, setKeyCmd.Arg(0), setKeyCmd.Arg(1), *setKeyServer, *setKeyBeta); err != nil {
 			log.Fatalf("Set key failed: %v", err)
 		}
 	case "wget":
@@ -199,7 +205,7 @@ func main() {
 		if wgetCmd.NArg() < 1 {
 			log.Fatalf("Usage: vpnet-cli wget [-beta] [-region R] [-o FILE] URL")
 		}
-		if err := doWget(ctx, wgetCmd.Arg(0), *wgetOutput, *wgetRegion, *wgetBeta); err != nil {
+		if err := doWget(ctx, wgetCmd.Arg(0), *wgetOutput, *wgetRegion, *wgetServer, *wgetBeta); err != nil {
 			log.Fatalf("Download failed: %v", err)
 		}
 	default:
@@ -220,15 +226,16 @@ func printUsage() {
 	fmt.Println("  vpnet-cli order PLAN [CRYPTO]      - Create crypto payment order (1m, 1y, 3y)")
 	fmt.Println("                                       CRYPTO: BTC, LTC, USDT@polygon, etc.")
 	fmt.Println("  vpnet-cli set-email EMAIL          - Set email on anonymous account")
-	fmt.Println("  vpnet-cli connect [--token TOKEN]  - Connect to VPN")
+	fmt.Println("  vpnet-cli connect [--token TOKEN] [-region R] [-server IP]")
+	fmt.Println("                                     - Connect to VPN")
 	fmt.Println("  vpnet-cli disconnect               - Disconnect from VPN")
 	fmt.Println("  vpnet-cli status                   - Show connection status")
 	fmt.Println("  vpnet-cli servers [--beta]         - List available servers")
-	fmt.Println("  vpnet-cli ping [-c N] [-region R] [TARGET]")
+	fmt.Println("  vpnet-cli ping [-c N] [-region R] [-server IP] [TARGET]")
 	fmt.Println("                                     - Ping through VPN tunnel (no root needed)")
-	fmt.Println("  vpnet-cli set-key [-beta] PUBKEY REGION")
+	fmt.Println("  vpnet-cli set-key [-beta] [-server IP] PUBKEY REGION")
 	fmt.Println("                                     - Register WireGuard public key and output config")
-	fmt.Println("  vpnet-cli wget [-beta] [-region R] [-o FILE] URL")
+	fmt.Println("  vpnet-cli wget [-beta] [-region R] [-server IP] [-o FILE] URL")
 	fmt.Println("                                     - Download file through VPN tunnel")
 }
 
@@ -721,7 +728,7 @@ func promptLine(prompt string) string {
 	return strings.TrimSpace(line)
 }
 
-func doConnect(ctx context.Context, token string) error {
+func doConnect(ctx context.Context, token, regionID, serverIP string, useBeta bool) error {
 	// Load or create auth
 	auth, err := loadAuth()
 	if err != nil {
@@ -740,42 +747,52 @@ func doConnect(ctx context.Context, token string) error {
 		return err
 	}
 
-	// Fetch server list and enclave list
-	fmt.Println("Fetching server list...")
-	serverList, err := fetchServerList(ctx, cfg.UseBeta)
-	if err != nil {
-		return err
-	}
-
 	enclaveList, err := fetchEnclaveList(ctx)
 	if err != nil {
 		return err
 	}
 
-	// Find a suitable server
-	var selectedRegion *Region
-	for i := range serverList.Regions {
-		region := &serverList.Regions[i]
-		if !region.Offline && region.AutoRegion {
-			selectedRegion = region
-			break
+	var selectedServer Server
+	if serverIP != "" {
+		// Direct server IP specified, skip region resolution
+		selectedServer = Server{IP: serverIP}
+		fmt.Printf("Connecting to server: %s\n", serverIP)
+	} else {
+		// Fetch server list and find region
+		fmt.Println("Fetching server list...")
+		serverList, err := fetchServerList(ctx, useBeta || cfg.UseBeta)
+		if err != nil {
+			return err
 		}
+
+		var selectedRegion *Region
+		for i := range serverList.Regions {
+			region := &serverList.Regions[i]
+			if regionID != "" {
+				if region.ID == regionID || region.Name == regionID {
+					selectedRegion = region
+					break
+				}
+			} else if !region.Offline && region.AutoRegion {
+				selectedRegion = region
+				break
+			}
+		}
+
+		if selectedRegion == nil {
+			return fmt.Errorf("no available servers found")
+		}
+
+		fmt.Printf("Selected region: %s (%s)\n", selectedRegion.Name, selectedRegion.Country)
+
+		wgServers, ok := selectedRegion.Servers["wg"]
+		if !ok || len(wgServers) == 0 {
+			return fmt.Errorf("no WireGuard servers available in selected region")
+		}
+
+		selectedServer = wgServers[0]
+		fmt.Printf("Connecting to server: %s\n", selectedServer.CN)
 	}
-
-	if selectedRegion == nil {
-		return fmt.Errorf("no available servers found")
-	}
-
-	fmt.Printf("Selected region: %s (%s)\n", selectedRegion.Name, selectedRegion.Country)
-
-	// Get WireGuard servers from this region
-	wgServers, ok := selectedRegion.Servers["wg"]
-	if !ok || len(wgServers) == 0 {
-		return fmt.Errorf("no WireGuard servers available in selected region")
-	}
-
-	selectedServer := wgServers[0]
-	fmt.Printf("Connecting to server: %s\n", selectedServer.CN)
 
 	// Register our public key with the server via direct HTTPS
 	fmt.Println("Registering with server...")
@@ -821,7 +838,7 @@ func generateWireGuardKeyPair() (privateKey, publicKey string, err error) {
 	return privateKey, publicKey, nil
 }
 
-func doSetKey(ctx context.Context, pubKeyB64, regionName string, useBeta bool) error {
+func doSetKey(ctx context.Context, pubKeyB64, regionName, serverIP string, useBeta bool) error {
 	keyBytes, err := base64.StdEncoding.DecodeString(pubKeyB64)
 	if err != nil {
 		return fmt.Errorf("invalid base64: %w", err)
@@ -840,34 +857,39 @@ func doSetKey(ctx context.Context, pubKeyB64, regionName string, useBeta bool) e
 		return err
 	}
 
-	serverList, err := fetchServerList(ctx, useBeta || cfg.UseBeta)
-	if err != nil {
-		return err
-	}
-
 	enclaveList, err := fetchEnclaveList(ctx)
 	if err != nil {
 		return err
 	}
 
-	// Find region
-	var region *Region
-	for i := range serverList.Regions {
-		r := &serverList.Regions[i]
-		if r.ID == regionName || r.Name == regionName {
-			region = r
-			break
+	var selectedServer Server
+	if serverIP != "" {
+		selectedServer = Server{IP: serverIP}
+	} else {
+		serverList, err := fetchServerList(ctx, useBeta || cfg.UseBeta)
+		if err != nil {
+			return err
 		}
-	}
-	if region == nil {
-		return fmt.Errorf("region not found: %s", regionName)
-	}
 
-	wgServers, ok := region.Servers["wg"]
-	if !ok || len(wgServers) == 0 {
-		return fmt.Errorf("no WireGuard servers in region %s", region.Name)
+		// Find region
+		var region *Region
+		for i := range serverList.Regions {
+			r := &serverList.Regions[i]
+			if r.ID == regionName || r.Name == regionName {
+				region = r
+				break
+			}
+		}
+		if region == nil {
+			return fmt.Errorf("region not found: %s", regionName)
+		}
+
+		wgServers, ok := region.Servers["wg"]
+		if !ok || len(wgServers) == 0 {
+			return fmt.Errorf("no WireGuard servers in region %s", region.Name)
+		}
+		selectedServer = wgServers[0]
 	}
-	selectedServer := wgServers[0]
 
 	// Register public key with the server
 	regResult, err := registerWithServer(selectedServer.IP, pubKeyB64, auth.data.APIToken, enclaveList)
